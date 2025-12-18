@@ -255,14 +255,12 @@ class _WebviewScreenState extends State<WebviewScreen> {
                   },
                 );
               },
-              onPermissionRequest: Platform.isAndroid
-                  ? null
-                  : (controller, origin) async {
-                      return PermissionResponse(
-                        resources: [],
-                        action: PermissionResponseAction.GRANT,
-                      );
-                    },
+              onPermissionRequest: (controller, origin) async {
+                return PermissionResponse(
+                  resources: origin.resources,
+                  action: PermissionResponseAction.GRANT,
+                );
+              },
               onLoadStop: (controller, url) {
                 pullToRefreshController.endRefreshing();
               },
