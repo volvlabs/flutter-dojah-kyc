@@ -102,7 +102,8 @@ class WebviewScreen extends StatefulWidget {
   State<WebviewScreen> createState() => _WebviewScreenState();
 }
 
-class _WebviewScreenState extends State<WebviewScreen> {
+class _WebviewScreenState extends State<WebviewScreen>
+    with WidgetsBindingObserver {
   final Set<Factory<OneSequenceGestureRecognizer>> gestureRecognizers = {
     Factory(() => EagerGestureRecognizer())
   };
@@ -114,13 +115,17 @@ class _WebviewScreenState extends State<WebviewScreen> {
 
   InAppWebViewSettings options = InAppWebViewSettings(
     allowsInlineMediaPlayback: true,
-    cacheEnabled: false, // Disable cache
-    clearCache: true, // Clear cache
+    cacheEnabled: false,
+    clearCache: true,
   );
 
-  bool isGranted = false;
-  bool isLocationGranted = false;
+  /// Permission state: 'loading', 'granted', 'denied', 'permanentlyDenied'
+  String _permissionState = 'loading';
 
+  /// Human-readable names of denied permissions (e.g. ['Camera', 'Microphone'])
+  List<String> _deniedPermissionNames = [];
+
+  bool isLocationGranted = false;
   bool isLocationPermissionGranted = false;
   dynamic locationData;
   dynamic timeZone;
@@ -130,9 +135,9 @@ class _WebviewScreenState extends State<WebviewScreen> {
   @override
   void initState() {
     super.initState();
-    getPermissions();
+    WidgetsBinding.instance.addObserver(this);
+    _requestPermissions();
     pullToRefreshController = PullToRefreshController(
-      //settings: PullToRefreshSettings(color: Colors.blue),
       onRefresh: () async {
         if (Platform.isAndroid) {
           _webViewController.reload();
@@ -145,41 +150,164 @@ class _WebviewScreenState extends State<WebviewScreen> {
     );
   }
 
-  Future getPermissions() async {
-    await initPermissions();
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
-  Future initPermissions() async {
-    await Permission.camera.request().then((value) {
-      if (value.isPermanentlyDenied) {
-        openAppSettings();
-      }
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        _permissionState == 'permanentlyDenied') {
+      _recheckPermissions();
+    }
+  }
+
+  Future<void> _requestPermissions() async {
+    final Map<Permission, PermissionStatus> statuses = await [
+      Permission.camera,
+      Permission.microphone,
+      Permission.locationWhenInUse,
+    ].request();
+
+    _evaluatePermissions(statuses);
+  }
+
+  Future<void> _recheckPermissions() async {
+    final cameraStatus = await Permission.camera.status;
+    final microphoneStatus = await Permission.microphone.status;
+    final locationStatus = await Permission.locationWhenInUse.status;
+
+    _evaluatePermissions({
+      Permission.camera: cameraStatus,
+      Permission.microphone: microphoneStatus,
+      Permission.locationWhenInUse: locationStatus,
     });
-    if (await Permission.camera.request().isGranted) {
+  }
+
+  void _evaluatePermissions(Map<Permission, PermissionStatus> statuses) {
+    final cameraStatus = statuses[Permission.camera]!;
+    final microphoneStatus = statuses[Permission.microphone]!;
+    final locationStatus = statuses[Permission.locationWhenInUse]!;
+
+    final List<String> permanentlyDenied = [];
+    if (cameraStatus.isPermanentlyDenied) permanentlyDenied.add('Camera');
+    if (microphoneStatus.isPermanentlyDenied) {
+      permanentlyDenied.add('Microphone');
+    }
+    if (locationStatus.isPermanentlyDenied) permanentlyDenied.add('Location');
+
+    final List<String> denied = [];
+    if (cameraStatus.isDenied) denied.add('Camera');
+    if (microphoneStatus.isDenied) denied.add('Microphone');
+    if (locationStatus.isDenied) denied.add('Location');
+
+    if (!mounted) return;
+
+    if (cameraStatus.isGranted) {
+      // Camera granted — webview can load.
       setState(() {
-        isGranted = true;
+        _permissionState = 'granted';
+        isLocationPermissionGranted = locationStatus.isGranted;
       });
-    } else {
-      Permission.camera.onDeniedCallback(() {
-        Permission.camera.request();
+    } else if (permanentlyDenied.isNotEmpty) {
+      setState(() {
+        _permissionState = 'permanentlyDenied';
+        _deniedPermissionNames = permanentlyDenied;
+      });
+      // Show dialog after the frame so context is ready
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showPermissionDialog(isPermanent: true);
+      });
+    } else if (denied.isNotEmpty) {
+      setState(() {
+        _permissionState = 'denied';
+        _deniedPermissionNames = denied;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showPermissionDialog(isPermanent: false);
       });
     }
+  }
+
+  Future<void> _showPermissionDialog({required bool isPermanent}) async {
+    final permissionNames = _deniedPermissionNames.join(', ');
+
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          title: Text(
+            isPermanent ? 'Permissions Required' : 'Permissions Needed',
+          ),
+          content: Text(
+            isPermanent
+                ? 'Dojah KYC requires the following permissions for identity verification: $permissionNames.\n\n'
+                    'These permissions have been previously denied. '
+                    'Please enable them in your device settings to continue.'
+                : 'Dojah KYC needs the following permissions to work properly: $permissionNames.\n\n'
+                    'These are required for ID capture, selfie verification, and location services.',
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                Navigator.of(context).pop();
+              },
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () async {
+                Navigator.of(dialogContext).pop();
+                if (isPermanent) {
+                  await openAppSettings();
+                  // Re-check happens in didChangeAppLifecycleState
+                } else {
+                  await _requestPermissions();
+                }
+              },
+              child: Text(
+                isPermanent ? 'Open Settings' : 'Grant Permissions',
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(),
-      body: isGranted
-          ? InAppWebView(
-              key: webViewKey,
-              gestureRecognizers: gestureRecognizers,
-              initialSettings: options,
-              initialData: InAppWebViewInitialData(
-                baseUrl: WebUri("https://widget.dojah.io"),
-                historyUrl: WebUri("https://widget.dojah.io"),
-                mimeType: "text/html",
-                data: """
+      body: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    switch (_permissionState) {
+      case 'granted':
+        return _buildWebView();
+      case 'denied':
+      case 'permanentlyDenied':
+      case 'loading':
+      default:
+        return const Center(child: CircularProgressIndicator());
+    }
+  }
+
+  Widget _buildWebView() {
+    return InAppWebView(
+      key: webViewKey,
+      gestureRecognizers: gestureRecognizers,
+      initialSettings: options,
+      initialData: InAppWebViewInitialData(
+        baseUrl: WebUri("https://widget.dojah.io"),
+        historyUrl: WebUri("https://widget.dojah.io"),
+        mimeType: "text/html",
+        data: """
                       <html lang="en">
                         <head>
                             <meta charset="UTF-8">
@@ -223,72 +351,63 @@ class _WebviewScreenState extends State<WebviewScreen> {
                         </body>
                       </html>
                   """,
-              ),
-              initialUrlRequest: URLRequest(
-                url: WebUri("https://widget.dojah.io"),
-              ),
-              pullToRefreshController: pullToRefreshController,
-              onWebViewCreated: (controller) {
-                _webViewController = controller;
+      ),
+      initialUrlRequest: URLRequest(
+        url: WebUri("https://widget.dojah.io"),
+      ),
+      pullToRefreshController: pullToRefreshController,
+      onWebViewCreated: (controller) {
+        _webViewController = controller;
 
-                _webViewController.addJavaScriptHandler(
-                  handlerName: 'onSuccessCallback',
-                  callback: (response) {
-                    widget.success(response);
-                  },
-                );
+        _webViewController.addJavaScriptHandler(
+          handlerName: 'onSuccessCallback',
+          callback: (response) {
+            widget.success(response);
+          },
+        );
 
-                _webViewController.addJavaScriptHandler(
-                  handlerName: 'onCloseCallback',
-                  callback: (response) {
-                    widget.close(response);
-                    // if (response.first == 'close') {
-                    //   Navigator.pop(context);
-                    // }
-                  },
-                );
+        _webViewController.addJavaScriptHandler(
+          handlerName: 'onCloseCallback',
+          callback: (response) {
+            widget.close(response);
+            // if (response.first == 'close') {
+            //   Navigator.pop(context);
+            // }
+          },
+        );
 
-                _webViewController.addJavaScriptHandler(
-                  handlerName: 'onErrorCallback',
-                  callback: (error) {
-                    widget.error(error);
-                  },
-                );
-              },
-              onPermissionRequest: (controller, origin) async {
-                return PermissionResponse(
-                  resources: origin.resources,
-                  action: PermissionResponseAction.GRANT,
-                );
-              },
-              onLoadStop: (controller, url) {
-                pullToRefreshController.endRefreshing();
-              },
-              onReceivedError: (controller, url, code) {
-                pullToRefreshController.endRefreshing();
-              },
-              onProgressChanged: (controller, progress) {
-                if (progress == 100) {
-                  pullToRefreshController.endRefreshing();
-                }
-                setState(() {
-                  this.progress = progress / 100;
-                });
-              },
-              androidOnPermissionRequest:
-                  (controller, origin, resources) async {
-                return PermissionRequestResponse(
-                    resources: resources,
-                    action: PermissionRequestResponseAction.GRANT);
-              },
-              androidOnGeolocationPermissionsShowPrompt:
-                  (controller, origin) async {
-                return GeolocationPermissionShowPromptResponse(
-                    allow: true, origin: origin, retain: true);
-              },
-              onConsoleMessage: (controller, consoleMessage) {},
-            )
-          : const Center(child: CircularProgressIndicator()),
+        _webViewController.addJavaScriptHandler(
+          handlerName: 'onErrorCallback',
+          callback: (error) {
+            widget.error(error);
+          },
+        );
+      },
+      onPermissionRequest: (controller, origin) async {
+        return PermissionResponse(
+          resources: origin.resources,
+          action: PermissionResponseAction.GRANT,
+        );
+      },
+      onLoadStop: (controller, url) {
+        pullToRefreshController.endRefreshing();
+      },
+      onReceivedError: (controller, url, code) {
+        pullToRefreshController.endRefreshing();
+      },
+      onProgressChanged: (controller, progress) {
+        if (progress == 100) {
+          pullToRefreshController.endRefreshing();
+        }
+        setState(() {
+          this.progress = progress / 100;
+        });
+      },
+      onGeolocationPermissionsShowPrompt: (controller, origin) async {
+        return GeolocationPermissionShowPromptResponse(
+            allow: true, origin: origin, retain: true);
+      },
+      onConsoleMessage: (controller, consoleMessage) {},
     );
   }
 }
