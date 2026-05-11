@@ -115,6 +115,7 @@ class _WebviewScreenState extends State<WebviewScreen>
 
   InAppWebViewSettings options = InAppWebViewSettings(
     allowsInlineMediaPlayback: true,
+    mediaPlaybackRequiresUserGesture: false,
     cacheEnabled: false,
     clearCache: true,
   );
@@ -299,61 +300,15 @@ class _WebviewScreenState extends State<WebviewScreen>
   }
 
   Widget _buildWebView() {
+    // Load the real Dojah domain first to establish a proper origin,
+    // then inject the widget initialization script after load.
+    // This fixes both getUserMedia() on iOS and ensures the SDK initializes.
     return InAppWebView(
       key: webViewKey,
       gestureRecognizers: gestureRecognizers,
       initialSettings: options,
-      initialData: InAppWebViewInitialData(
-        baseUrl: WebUri("https://widget.dojah.io"),
-        historyUrl: WebUri("https://widget.dojah.io"),
-        mimeType: "text/html",
-        data: """
-                      <html lang="en">
-                        <head>
-                            <meta charset="UTF-8">
-                                <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1, maximum-scale=1, minimum-scale=1, shrink-to-fit=1"/>
-                              
-                            <title>Dojah Inc.</title>
-                        </head>
-                        <body>
-                  
-   
-                       <script src="https://widget.dojah.io/widget.js"></script>
-
-                      
-                        <script>
-                                  const options = {
-                                      app_id: "${widget.appId}",
-                                      p_key: "${widget.publicKey}",
-                                      type: "${widget.type}",
-                                      reference_id: "${widget.referenceId}",
-                                      config: ${json.encode(widget.config ?? {})},
-                                      user_data: ${json.encode(widget.userData ?? {})},
-                                      gov_data: ${json.encode(widget.govData ?? {})},
-                                      gov_id: ${json.encode(widget.govId ?? {})},
-                                      location: ${json.encode(locationObject ?? {})},
-                                      metadata: ${json.encode(widget.metaData ?? {})},
-                                      onSuccess: function (response) {
-                                      window.flutter_inappwebview.callHandler('onSuccessCallback', response)
-                                      },
-                                      onError: function (error) {
-                                        window.flutter_inappwebview.callHandler('onErrorCallback', error)
-                                      },
-                                      onClose: function () {
-                                        window.flutter_inappwebview.callHandler('onCloseCallback', 'close')
-                                      }
-                                  }
-
-                                    const connect = new Connect(options);
-                                    connect.setup();
-                                    connect.open();
-                              </script>
-                        </body>
-                      </html>
-                  """,
-      ),
       initialUrlRequest: URLRequest(
-        url: WebUri("https://widget.dojah.io"),
+        url: WebUri("https://widget.dojah.io/"),
       ),
       pullToRefreshController: pullToRefreshController,
       onWebViewCreated: (controller) {
@@ -361,53 +316,101 @@ class _WebviewScreenState extends State<WebviewScreen>
 
         _webViewController.addJavaScriptHandler(
           handlerName: 'onSuccessCallback',
-          callback: (response) {
-            widget.success(response);
-          },
+          callback: (response) => widget.success(response),
         );
 
         _webViewController.addJavaScriptHandler(
           handlerName: 'onCloseCallback',
-          callback: (response) {
-            widget.close(response);
-            // if (response.first == 'close') {
-            //   Navigator.pop(context);
-            // }
-          },
+          callback: (response) => widget.close(response),
         );
 
         _webViewController.addJavaScriptHandler(
           handlerName: 'onErrorCallback',
-          callback: (error) {
-            widget.error(error);
-          },
+          callback: (error) => widget.error(error),
         );
       },
-      onPermissionRequest: (controller, origin) async {
+      onLoadStop: (controller, url) async {
+        pullToRefreshController.endRefreshing();
+
+        // Inject the Dojah widget script and initialize it.
+        // JSON-encoded values are valid JS literals for objects/strings.
+        final configJson = jsonEncode(widget.config ?? {});
+        final userDataJson = jsonEncode(widget.userData ?? {});
+        final govDataJson = jsonEncode(widget.govData ?? {});
+        final govIdJson = jsonEncode(widget.govId ?? {});
+        final locationJson = jsonEncode(locationObject ?? {});
+        final metaDataJson = jsonEncode(widget.metaData ?? {});
+
+        await controller.evaluateJavascript(source: '''
+          (function() {
+            if (window.__dojahInjected) return;
+            window.__dojahInjected = true;
+
+            document.body.innerHTML = '';
+            document.head.innerHTML = '<meta charset="UTF-8">' +
+              '<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1, maximum-scale=1, minimum-scale=1, shrink-to-fit=1"/>' +
+              '<title>Dojah Inc.</title>';
+
+            var script = document.createElement('script');
+            script.src = 'https://widget.dojah.io/widget.js';
+            script.onload = function() {
+              var options = {
+                app_id: ${jsonEncode(widget.appId)},
+                p_key: ${jsonEncode(widget.publicKey)},
+                type: ${jsonEncode(widget.type)},
+                reference_id: ${jsonEncode(widget.referenceId ?? '')},
+                config: $configJson,
+                user_data: $userDataJson,
+                gov_data: $govDataJson,
+                gov_id: $govIdJson,
+                location: $locationJson,
+                metadata: $metaDataJson,
+                onSuccess: function(response) {
+                  window.flutter_inappwebview.callHandler('onSuccessCallback', response);
+                },
+                onError: function(error) {
+                  window.flutter_inappwebview.callHandler('onErrorCallback', error);
+                },
+                onClose: function() {
+                  window.flutter_inappwebview.callHandler('onCloseCallback', 'close');
+                }
+              };
+              var connect = new Connect(options);
+              connect.setup();
+              connect.open();
+            };
+            script.onerror = function() {
+              window.flutter_inappwebview.callHandler('onErrorCallback', 'Failed to load Dojah widget.js');
+            };
+            document.head.appendChild(script);
+          })();
+        ''');
+      },
+      onPermissionRequest: (controller, request) async {
         return PermissionResponse(
-          resources: origin.resources,
+          resources: request.resources,
           action: PermissionResponseAction.GRANT,
         );
       },
-      onLoadStop: (controller, url) {
-        pullToRefreshController.endRefreshing();
-      },
-      onReceivedError: (controller, url, code) {
+      onReceivedError: (controller, request, error) {
         pullToRefreshController.endRefreshing();
       },
       onProgressChanged: (controller, progress) {
-        if (progress == 100) {
-          pullToRefreshController.endRefreshing();
-        }
-        setState(() {
-          this.progress = progress / 100;
-        });
+        if (progress == 100) pullToRefreshController.endRefreshing();
+        setState(() => this.progress = progress / 100);
       },
       onGeolocationPermissionsShowPrompt: (controller, origin) async {
         return GeolocationPermissionShowPromptResponse(
-            allow: true, origin: origin, retain: true);
+          allow: true,
+          origin: origin,
+          retain: true,
+        );
       },
-      onConsoleMessage: (controller, consoleMessage) {},
+      onConsoleMessage: (controller, consoleMessage) {
+        if (kDebugMode) {
+          print('DojahWebView: ${consoleMessage.message}');
+        }
+      },
     );
   }
 }
